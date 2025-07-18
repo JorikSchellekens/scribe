@@ -1,0 +1,15 @@
+{
+  "title": "Scribe",
+  "description": "A minimal static site generator • ink • eternal",
+  "author": "Author",
+  "url": "https://example.com",
+  "posts_dir": "posts",
+  "output_dir": "dist",
+  "openai_api_key": null,
+  "theme": {
+    "primary_color": "#f5f5f5",
+    "background_color": "#0a0a0a",
+    "text_color": "#f5f5f5",
+    "accent_color": "#8b8b8b"
+  }
+}
