@@ -22,8 +22,4 @@ cargo install --path .
 echo "Installation complete!"
 echo ""
 echo "Usage:"
-echo "  scribe                    # Generate site with default config"
-echo "  scribe --help             # Show help"
-echo "  scribe --config my.json   # Use custom config file"
-echo ""
-echo "The site generator will create a config.json file on first run." 
+scribe --help 
