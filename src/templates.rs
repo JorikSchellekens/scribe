@@ -61,6 +61,9 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<S
         )
     };
     
+    // Use relative paths (works for both regular hosting and IPFS)
+    let (css_path, home_path) = ("../style.css", "../");
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -68,7 +71,7 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<S
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - {}</title>
-    <link rel="stylesheet" href="/style.css">
+    <link rel="stylesheet" href="{}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Crimson+Text:ital,wght@0,400;0,600;1,400&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
@@ -77,8 +80,8 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<S
     <div class="container">
         <header>
             <div class="header-content">
-                <a href="/" class="pilcrow">¶</a>
-                <a href="/" class="main-title">{}</a>
+                <a href="{}" class="pilcrow">¶</a>
+                <a href="{}" class="main-title">{}</a>
             </div>
         </header>
         
@@ -94,18 +97,22 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<S
         </main>
         
         <footer>
-            <a href="/" class="home-link">← Back to all posts</a>
+            <a href="{}" class="home-link">← Back to all posts</a>
         </footer>
     </div>
 </body>
 </html>"#,
         post.title,
         config.title,
+        css_path,
+        home_path,
+        home_path,
         config.title.to_uppercase(),
         post.title,
         initial_html,
         processed_content,
-        backlinks_html
+        backlinks_html,
+        home_path
     );
     
     Ok(html)
@@ -119,15 +126,17 @@ pub fn render_index(config: &Config, posts: &[Post]) -> Result<String> {
                 format!("<p class=\"excerpt\">{}</p>", excerpt)
             });
             
+            let post_path = format!("./{}/", post.slug);
+            
             format!(
                 r#"<article class="post-preview">
     <div class="post-header">
-        <h2><a href="/{}/">{}</a></h2>
+        <h2><a href="{}">{}</a></h2>
         <time datetime="{}">{}</time>
     </div>
     {}
 </article>"#,
-                post.slug,
+                post_path,
                 post.title,
                 post.date.to_rfc3339(),
                 post.date.format("%d/%m/%Y").to_string(),
@@ -137,6 +146,9 @@ pub fn render_index(config: &Config, posts: &[Post]) -> Result<String> {
         .collect::<Vec<_>>()
         .join("\n");
     
+    // Use relative paths (works for both regular hosting and IPFS)
+    let (css_path, home_path) = ("./style.css", "./");
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -144,7 +156,7 @@ pub fn render_index(config: &Config, posts: &[Post]) -> Result<String> {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{}</title>
-    <link rel="stylesheet" href="/style.css">
+    <link rel="stylesheet" href="{}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Crimson+Text:ital,wght@0,400;0,600;1,400&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
@@ -153,8 +165,8 @@ pub fn render_index(config: &Config, posts: &[Post]) -> Result<String> {
     <div class="container">
         <header>
             <div class="header-content">
-                <a href="/" class="pilcrow">¶</a>
-                <a href="/" class="main-title">{}</a>
+                <a href="{}" class="pilcrow">¶</a>
+                <a href="{}" class="main-title">{}</a>
             </div>
         </header>
         
@@ -167,6 +179,9 @@ pub fn render_index(config: &Config, posts: &[Post]) -> Result<String> {
 </body>
 </html>"#,
         config.title,
+        css_path,
+        home_path,
+        home_path,
         config.title.to_uppercase(),
         posts_list
     );
@@ -587,7 +602,7 @@ fn find_backlinks(posts: &[Post], current_slug: &str) -> Vec<Backlink> {
             if post.html_content.contains(&format!("/{}/", current_slug)) {
                 backlinks.push(Backlink {
                     title: post.title.clone(),
-                    url: format!("/{}/", post.slug),
+                    url: format!("../{}/", post.slug),
                 });
             }
         }

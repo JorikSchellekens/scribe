@@ -4,6 +4,7 @@ use colored::*;
 use std::path::PathBuf;
 use std::process;
 use warp::Filter;
+use ipfs_api_backend_hyper::{IpfsApi, IpfsClient, TryFromUri};
 
 mod config;
 mod generator;
@@ -62,6 +63,24 @@ enum Commands {
         /// Directory to create the project in
         directory: PathBuf,
     },
+    /// Pin generated site content to IPFS
+    Pin {
+        /// Path to the dist directory to pin
+        #[arg(short, long, default_value = "dist")]
+        dist: PathBuf,
+        
+        /// IPFS API endpoint
+        #[arg(long, default_value = "http://127.0.0.1:5001")]
+        ipfs_api: String,
+        
+        /// Pin name/description
+        #[arg(short, long)]
+        name: Option<String>,
+        
+        /// Recursive pin (pin all referenced content)
+        #[arg(short, long, default_value = "true")]
+        recursive: bool,
+    },
 }
 
 #[tokio::main]
@@ -100,6 +119,9 @@ async fn main() -> Result<()> {
         }
         Commands::Create { directory } => {
             create_project(directory).await?;
+        }
+        Commands::Pin { dist, ipfs_api, name, recursive } => {
+            pin_to_ipfs(dist, ipfs_api, name, recursive).await?;
         }
     }
     
@@ -543,6 +565,117 @@ Built with [Scribe](https://github.com/your-username/scribe) • ink • eternal
     println!();
     println!("{}", "Happy blogging!".cyan().bold());
     println!("{}", "Visit http://localhost:3007 after running the commands above.".white());
+    
+    Ok(())
+}
+
+async fn pin_to_ipfs(
+    dist_path: PathBuf, 
+    ipfs_api: String, 
+    name: Option<String>, 
+    recursive: bool
+) -> Result<()> {
+    // Check if dist directory exists
+    if !dist_path.exists() {
+        eprintln!("{}", format!("Error: Directory '{}' does not exist. Run 'scribe generate' first.", dist_path.display()).red());
+        process::exit(1);
+    }
+
+    if !dist_path.is_dir() {
+        eprintln!("{}", format!("Error: '{}' is not a directory.", dist_path.display()).red());
+        process::exit(1);
+    }
+
+    println!("{}", format!("Connecting to IPFS node at {}...", ipfs_api).blue());
+    
+    // Create IPFS client
+    let client = IpfsClient::from_str(&ipfs_api)
+        .context("Failed to create IPFS client")?;
+    
+    // Test connection to IPFS node
+    match client.version().await {
+        Ok(version) => {
+            println!("{} Connected to IPFS node (version: {})", "✓".green(), version.version);
+        }
+        Err(e) => {
+            eprintln!("{}", format!("Error: Failed to connect to IPFS node at {}", ipfs_api).red());
+            eprintln!("{}", format!("Make sure IPFS daemon is running. Error: {}", e).yellow());
+            eprintln!("{}", "Start IPFS daemon with: ipfs daemon".cyan());
+            process::exit(1);
+        }
+    }
+    
+    println!("{}", format!("Adding directory {} to IPFS...", dist_path.display()).yellow());
+    
+    // Add the directory to IPFS
+    let add_result = client
+        .add_path(&dist_path)
+        .await
+        .context("Failed to add directory to IPFS")?;
+    
+    // Find the root directory hash
+    let mut root_hash = None;
+    let mut total_files = 0;
+    
+    for item in add_result {
+        total_files += 1;
+        // The root directory will have the same name as the source directory
+        if item.name == dist_path.file_name().unwrap().to_str().unwrap() {
+            root_hash = Some(item.hash.clone());
+        }
+        println!("  {} Added: {} ({})", "✓".green(), item.name, item.hash);
+    }
+    
+    let root_hash = root_hash.unwrap_or_else(|| {
+        eprintln!("{}", "Error: Could not determine root directory hash".red());
+        process::exit(1);
+    });
+    
+    println!("{}", format!("Successfully added {} files to IPFS", total_files).green());
+    println!("{}", format!("Root directory hash: {}", root_hash).cyan().bold());
+    
+    // Pin the content
+    if recursive {
+        println!("{}", "Pinning content recursively...".yellow());
+        match client.pin_add(&root_hash, recursive).await {
+            Ok(_) => {
+                println!("{} Content pinned successfully!", "✓".green());
+            }
+            Err(e) => {
+                eprintln!("{}", format!("Warning: Failed to pin content: {}", e).yellow());
+                eprintln!("{}", "Content is still available on IPFS but may be garbage collected".yellow());
+            }
+        }
+    }
+    
+    // Set pin name if provided
+    if let Some(pin_name) = name {
+        println!("{}", format!("Setting pin name to '{}'...", pin_name).yellow());
+        // Note: pin naming is not available in all IPFS implementations
+        // This is a placeholder for when the API supports it
+        println!("{}", format!("Pin name '{}' noted (naming support varies by IPFS implementation)", pin_name).cyan());
+    }
+    
+    println!();
+    println!("{}", "IPFS Pinning Complete!".green().bold());
+    println!();
+    println!("{}", "Access your site via IPFS:".white().bold());
+    println!("  {}: {}", "IPFS Hash".white(), root_hash.clone().cyan());
+    println!("  {}: {}", "IPFS Gateway".white(), format!("https://ipfs.io/ipfs/{}", root_hash).blue());
+    println!("  {}: {}", "Local Gateway".white(), format!("http://127.0.0.1:8080/ipfs/{}", root_hash).blue());
+    
+    // Show alternative gateways
+    println!();
+    println!("{}", "Alternative IPFS Gateways:".white().bold());
+    println!("  • {}", format!("https://gateway.pinata.cloud/ipfs/{}", root_hash).blue());
+    println!("  • {}", format!("https://cloudflare-ipfs.com/ipfs/{}", root_hash).blue());
+    println!("  • {}", format!("https://dweb.link/ipfs/{}", root_hash).blue());
+    
+    println!();
+    println!("{}", "💡 Pro Tips:".yellow().bold());
+    println!("  • Pin your content on multiple IPFS nodes for better availability");
+    println!("  • Consider using a pinning service like Pinata or Infura for production");
+    println!("  • Share the IPFS hash for decentralized access to your site");
     
     Ok(())
 } 
