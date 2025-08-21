@@ -102,6 +102,22 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<S
             <a href="{}" class="home-link">← Back to all posts</a>
         </footer>
     </div>
+    <script>
+    document.addEventListener('DOMContentLoaded', function() {{
+        var paragraphs = document.querySelectorAll('.post-content p');
+        paragraphs.forEach(function(p) {{
+            var text = (p.textContent || '').trim();
+            if (!text) return;
+            var a = document.createElement('a');
+            a.className = 'exa-link';
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.textContent = '↗';
+            a.href = 'https://exa.ai/search?q=' + encodeURIComponent(text);
+            p.appendChild(a);
+        }});
+    }});
+    </script>
 </body>
 </html>"#,
         post.title,
@@ -334,6 +350,8 @@ header {
   margin-bottom: 1.5em;
   text-align: justify;
   hyphens: auto;
+  position: relative;
+  padding-right: 1.5em;
 }
 
 .post-content h1 {
@@ -448,6 +466,26 @@ a {
 a:hover {
   color: #f5f5f5;
   text-decoration-color: #8b8b8b;
+}
+
+/* Exa search link per paragraph */
+.exa-link {
+  position: absolute;
+  right: 0;
+  top: 0.1em;
+  font-size: 0.9em;
+  color: #8b8b8b;
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity 0.2s ease, color 0.2s ease;
+}
+
+.post-content p:hover .exa-link {
+  opacity: 1;
+}
+
+.exa-link:hover {
+  color: #f5f5f5;
 }
 
 /* Backlinks section */
@@ -614,6 +652,10 @@ footer {
   }
   
   .illuminated-initial {
+    display: none;
+  }
+  
+  .exa-link {
     display: none;
   }
 }"#.to_string()
