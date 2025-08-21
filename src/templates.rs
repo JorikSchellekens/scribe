@@ -88,7 +88,6 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post], annotation_
     <div class="container">
         <header>
             <div class="header-content">
-                <a href="{}" class="pilcrow">¶</a>
                 <a href="{}" class="main-title">{}</a>
             </div>
         </header>
@@ -392,7 +391,6 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post], annotation_
         css_path,
         annotation_meta,
         home_path,
-        home_path,
         config.title.to_uppercase(),
         post.title,
         initial_html,
@@ -481,7 +479,6 @@ pub fn render_index(config: &Config, posts: &[Post]) -> Result<String> {
     <div class="container">
         <header>
             <div class="header-content">
-                <a href="{}" class="pilcrow">¶</a>
                 <a href="{}" class="main-title">{}</a>
             </div>
         </header>
@@ -496,7 +493,6 @@ pub fn render_index(config: &Config, posts: &[Post]) -> Result<String> {
 </html>"#,
         config.title,
         css_path,
-        home_path,
         home_path,
         config.title.to_uppercase(),
         posts_list
@@ -540,20 +536,9 @@ header {
 .header-content {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
 }
 
-.pilcrow {
-  font-size: 24px;
-  color: #f5f5f5;
-  font-weight: 400;
-  text-decoration: none;
-  transition: color 0.2s ease;
-}
-
-.pilcrow:hover {
-  color: #8b8b8b;
-}
 
 .main-title {
   font-family: 'Crimson Text', Georgia, serif;
@@ -659,14 +644,6 @@ header {
   text-align: right;
 }
 
-.post-content h3::before {
-  content: '¶';
-  position: absolute;
-  left: 0;
-  top: 0;
-  font-size: 16px;
-  color: #8b8b8b;
-}
 
 .post-content ul, .post-content ol {
   margin: 20px 0;
@@ -979,7 +956,8 @@ footer {
   .header-content {
     flex-direction: column;
     gap: 20px;
-    text-align: center;
+    text-align: right;
+    align-items: flex-end;
   }
   
   .post-header {
