@@ -101,8 +101,9 @@ impl SiteGenerator {
         // Parse frontmatter using serde_yaml
         let (frontmatter, markdown) = self.parse_frontmatter(content);
         
-        // Convert markdown to HTML
-        let html_content = to_html(&markdown);
+        // Convert markdown to HTML (autolink raw URLs first)
+        let autolinked_markdown = Self::autolink_markdown(&markdown);
+        let html_content = to_html(&autolinked_markdown);
         
         // Extract first paragraph for illuminated initial
         let first_paragraph_match = Regex::new(r"<p>(.*?)</p>").unwrap();
@@ -175,6 +176,118 @@ impl SiteGenerator {
             first_letter,
             frontmatter,
         })
+    }
+
+    /// Convert bare URLs in Markdown text to autolink format `<url>` while avoiding
+    /// fenced code blocks and inline code spans.
+    fn autolink_markdown(markdown: &str) -> String {
+        let mut result_lines: Vec<String> = Vec::new();
+        let mut in_code_block = false;
+        for line in markdown.lines() {
+            let trimmed_start = line.trim_start();
+            if trimmed_start.starts_with("```") {
+                // Toggle fenced code block state and pass line through unchanged
+                in_code_block = !in_code_block;
+                result_lines.push(line.to_string());
+                continue;
+            }
+
+            if in_code_block {
+                result_lines.push(line.to_string());
+                continue;
+            }
+
+            // Process inline code spans delimited by backticks, only autolink in non-code parts
+            let mut processed_line = String::with_capacity(line.len());
+            let mut in_inline_code = false;
+            let mut buffer = String::new();
+            for ch in line.chars() {
+                if ch == '`' {
+                    if in_inline_code {
+                        // Flush buffer as-is (inside code)
+                        processed_line.push_str(&buffer);
+                        buffer.clear();
+                        processed_line.push('`');
+                        in_inline_code = false;
+                    } else {
+                        // Flush buffer with autolinking (outside code)
+                        processed_line.push_str(&Self::autolink_text(&buffer));
+                        buffer.clear();
+                        processed_line.push('`');
+                        in_inline_code = true;
+                    }
+                } else {
+                    buffer.push(ch);
+                }
+            }
+            if in_inline_code {
+                // Remaining buffer is inside code
+                processed_line.push_str(&buffer);
+            } else {
+                processed_line.push_str(&Self::autolink_text(&buffer));
+            }
+
+            result_lines.push(processed_line);
+        }
+
+        result_lines.join("\n")
+    }
+
+    /// Autolink bare http/https URLs in a plain text segment (no inline/fenced code).
+    fn autolink_text(text: &str) -> String {
+        // Match a conservative URL, we'll handle trailing punctuation separately
+        let re = Regex::new(r"https?://[^\s<>()]+").unwrap();
+        let mut result = String::with_capacity(text.len());
+        let mut last_end = 0;
+        for m in re.find_iter(text) {
+            // Avoid transforming URLs that are part of a Markdown link: "](" immediately before
+            let start = m.start();
+            let end = m.end();
+            let before = &text[..start];
+            let after = &text[end..];
+
+            let is_md_link_target = before.ends_with("](");
+            // Avoid transforming URLs already inside angle brackets: "<url>"
+            let prev_byte_is_lt = before.as_bytes().last().map(|b| *b == b'<').unwrap_or(false);
+            let next_byte_is_gt = after.as_bytes().first().map(|b| *b == b'>').unwrap_or(false);
+            if is_md_link_target || (prev_byte_is_lt && next_byte_is_gt) {
+                continue;
+            }
+
+            // Push preceding text
+            result.push_str(&text[last_end..start]);
+
+            let matched = m.as_str();
+            let (core, trailing) = Self::split_trailing_punctuation(matched);
+            // Use explicit Markdown link syntax for broad renderer compatibility
+            result.push('[');
+            result.push_str(&core);
+            result.push(']');
+            result.push('(');
+            result.push_str(&core);
+            result.push(')');
+            result.push_str(&trailing);
+
+            last_end = end;
+        }
+        // Remainder
+        result.push_str(&text[last_end..]);
+        result
+    }
+
+    /// Split off common trailing punctuation that should not be part of the URL.
+    fn split_trailing_punctuation(s: &str) -> (String, String) {
+        let mut end = s.len();
+        let bytes = s.as_bytes();
+        while end > 0 {
+            let b = bytes[end - 1];
+            if matches!(b as char, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']') {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        (s[..end].to_string(), s[end..].to_string())
     }
 
     fn parse_frontmatter(&self, content: &str) -> (HashMap<String, serde_json::Value>, String) {
