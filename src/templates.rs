@@ -351,7 +351,6 @@ header {
   text-align: justify;
   hyphens: auto;
   position: relative;
-  padding-right: 1.5em;
 }
 
 .post-content h1 {
@@ -471,13 +470,14 @@ a:hover {
 /* Exa search link per paragraph */
 .exa-link {
   position: absolute;
-  right: 0;
+  right: -1.2em;
   top: 0.1em;
   font-size: 0.9em;
   color: #8b8b8b;
   text-decoration: none;
   opacity: 0;
   transition: opacity 0.2s ease, color 0.2s ease;
+  margin-left: 0.25em; /* used when inline on mobile */
 }
 
 .post-content p:hover .exa-link {
@@ -609,6 +609,16 @@ footer {
   
   .post-content {
     font-size: 18px;
+  }
+  
+  /* On mobile, render arrow as the last inline character */
+  .post-content p { padding-right: 0; }
+  .exa-link {
+    position: static;
+    right: auto;
+    top: auto;
+    display: inline;
+    opacity: 1;
   }
   
   .illuminated-initial {
