@@ -85,8 +85,18 @@ impl SiteGenerator {
         {
             let content = fs::read_to_string(entry.path())
                 .context(format!("Failed to read {}", entry.path().display()))?;
+            let had_frontmatter = content.lines().next().map(|l| l.trim() == "---").unwrap_or(false);
             
             let post = self.parse_post(&content, entry.path())?;
+
+            // If there was no frontmatter, write one in-place using derived values
+            if !had_frontmatter {
+                if let Err(e) = Self::write_frontmatter_in_place(entry.path(), &post, &content) {
+                    eprintln!("Warning: failed to write frontmatter for {}: {}", entry.path().display(), e);
+                } else {
+                    println!("{} {}", "Annotated".green(), entry.path().display());
+                }
+            }
             posts.push(post);
         }
         
@@ -94,6 +104,31 @@ impl SiteGenerator {
         posts.sort_by(|a, b| b.date.cmp(&a.date));
         
         self.posts = posts;
+        Ok(())
+    }
+
+    fn write_frontmatter_in_place(path: &Path, post: &Post, original_content: &str) -> Result<()> {
+        // Build YAML frontmatter
+        let title = post.title.replace('"', "\\\"");
+        let date = post.date.format("%Y-%m-%d").to_string();
+        let excerpt = post.excerpt.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.replace('"', "\\\"")).unwrap_or_default();
+
+        let mut header = String::new();
+        header.push_str("---\n");
+        header.push_str(&format!("title: \"{}\"\n", title));
+        header.push_str(&format!("date: \"{}\"\n", date));
+        if !excerpt.is_empty() {
+            header.push_str(&format!("excerpt: \"{}\"\n", excerpt));
+        }
+        header.push_str("---\n\n");
+
+        // Prepend header to original content
+        let mut new_content = String::with_capacity(header.len() + original_content.len() + 2);
+        new_content.push_str(&header);
+        new_content.push_str(original_content);
+
+        fs::write(path, new_content)
+            .context("Failed to write updated markdown with frontmatter")?;
         Ok(())
     }
 
@@ -112,6 +147,16 @@ impl SiteGenerator {
             .and_then(|caps| caps.get(1))
             .map(|m| m.as_str().to_string())
             .unwrap_or_default();
+        // Derive a plain-text, single-line description from the first paragraph
+        let first_paragraph_text_line1 = {
+            // Strip HTML tags conservatively
+            let no_tags = Regex::new(r"<[^>]+>")
+                .ok()
+                .map(|re| re.replace_all(&first_paragraph, "").to_string())
+                .unwrap_or_else(|| first_paragraph.clone());
+            let line1 = no_tags.lines().next().unwrap_or("").trim();
+            html_unescape(line1)
+        };
         
         // Extract first letter from first paragraph
         let first_letter = first_paragraph
@@ -130,32 +175,38 @@ impl SiteGenerator {
             })
             .to_string();
         
-        // Extract date from frontmatter or file modification time
+        // Extract date from frontmatter or file creation time (fallbacks to modified, then now)
         let date = frontmatter
             .get("date")
             .and_then(|v| v.as_str())
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&Utc))
             .unwrap_or_else(|| {
-                fs::metadata(path)
-                    .and_then(|m| m.modified())
-                    .map(|t| {
-                        let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+                let meta_result = fs::metadata(path);
+                if let Ok(meta) = meta_result {
+                    // Try created() first
+                    if let Ok(ct) = meta.created() {
+                        let secs = ct.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
                         DateTime::from_timestamp(secs, 0).unwrap_or_else(|| Utc::now())
-                    })
-                    .unwrap_or_else(|_| Utc::now())
+                    } else if let Ok(mt) = meta.modified() {
+                        let secs = mt.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+                        DateTime::from_timestamp(secs, 0).unwrap_or_else(|| Utc::now())
+                    } else {
+                        Utc::now()
+                    }
+                } else {
+                    Utc::now()
+                }
             });
         
-        // Extract excerpt from frontmatter or first paragraph
+        // Extract description/excerpt from frontmatter or first line of first paragraph
         let excerpt = frontmatter
             .get("excerpt")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .or_else(|| {
-                markdown
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .map(|line| line.trim().to_string())
+                let desc = first_paragraph_text_line1.trim();
+                if desc.is_empty() { None } else { Some(desc.to_string()) }
             });
         
         let original_slug = path

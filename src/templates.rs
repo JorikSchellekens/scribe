@@ -71,12 +71,21 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post], annotation_
         _ => String::new(),
     };
 
+    // Build optional meta description and publication time tags
+    let meta_description = match &post.excerpt {
+        Some(desc) if !desc.is_empty() => format!("<meta name=\"description\" content=\"{}\">", desc),
+        _ => String::new(),
+    };
+    let meta_published = format!("<meta property=\"article:published_time\" content=\"{}\">", post.date.to_rfc3339());
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    {}
+    {}
     <title>{} - {}</title>
     <link rel="stylesheet" href="{}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -386,6 +395,8 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post], annotation_
     </script>
 </body>
     </html>"#,
+        meta_description,
+        meta_published,
         post.title,
         config.title,
         css_path,
