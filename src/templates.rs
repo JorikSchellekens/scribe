@@ -3,7 +3,7 @@ use crate::generator::Post;
 use anyhow::Result;
 use regex;
 
-pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<String> {
+pub fn render_post(config: &Config, post: &Post, all_posts: &[Post], annotation_meta_json: Option<String>) -> Result<String> {
     let backlinks = find_backlinks(all_posts, &post.slug, &post.original_slug);
     
     let has_initial = post.first_letter.is_some();
@@ -66,6 +66,11 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<S
     // Use relative paths (works for both regular hosting and IPFS)
     let (css_path, home_path) = ("../style.css", "../");
 
+    let annotation_meta = match annotation_meta_json {
+        Some(json) if !json.is_empty() => format!("<script id=\"annotation-meta\" type=\"application/json\">{}</script>", json),
+        _ => String::new(),
+    };
+
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -77,6 +82,7 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<S
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Crimson+Text:ital,wght@0,400;0,600;1,400&family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    {}
 </head>
 <body>
     <div class="container">
@@ -104,6 +110,11 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<S
     </div>
     <script>
     document.addEventListener('DOMContentLoaded', function() {{
+        var meta = {{}};
+        var metaEl = document.getElementById('annotation-meta');
+        if (metaEl) {{
+            try {{ meta = JSON.parse(metaEl.textContent || '{{}}'); }} catch(e) {{ meta = {{}}; }}
+        }}
         var paragraphs = document.querySelectorAll('.post-content p');
         paragraphs.forEach(function(p) {{
             var text = (p.textContent || '').trim();
@@ -116,13 +127,270 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<S
             a.href = 'https://exa.ai/search?q=' + encodeURIComponent(text);
             p.appendChild(a);
         }});
+
+        // Annotations: convert fenced blocks (```links / ```anno) into folded panels attached to the previous paragraph/list
+        var codeBlocks = Array.prototype.slice.call(document.querySelectorAll('.post-content pre > code'));
+        codeBlocks.forEach(function(code) {{
+            var cls = (code.getAttribute('class') || '').toLowerCase();
+            var text = (code.textContent || '').trim();
+            var isAnnotated = false;
+            var lines = [];
+
+            // Detect by language class or explicit leading marker line
+            if (cls.indexOf('language-links') !== -1 || cls.indexOf('language-anno') !== -1 || cls.indexOf('language-annotation') !== -1) {{
+                isAnnotated = true;
+                lines = text.split('\n');
+            }} else if (/^(links|anno|annotation)\s*:?/i.test(text)) {{
+                isAnnotated = true;
+                lines = text.split('\n').slice(1);
+            }}
+
+            if (!isAnnotated) return;
+
+            // Determine target block to attach to: previous paragraph or list
+            var pre = code.parentElement && code.parentElement.tagName === 'PRE' ? code.parentElement : null;
+            if (!pre) return;
+            var target = pre.previousElementSibling;
+            while (target && ['P','UL','OL'].indexOf(target.tagName) === -1) {{
+                target = target.previousElementSibling;
+            }}
+            if (!target) return;
+
+            // Build panel content: parse lines into links with optional descriptions
+            var items = [];
+            lines.forEach(function(raw) {{
+                var line = raw.trim();
+                if (!line) return;
+                // trim leading bullets
+                line = line.replace(/^[-*]\s+/, '');
+
+                var title = null, url = null, desc = null, m;
+
+                // [Title](url) - desc
+                m = line.match(/^\[([^\]]+)\]\(([^)\s]+)\)(?:\s*[\-–—:]\s*(.+))?$/);
+                if (m) {{
+                    title = m[1];
+                    url = m[2];
+                    desc = m[3] ? m[3].trim() : null;
+                }}
+
+                // Title - url - desc
+                if (!url) {{
+                    m = line.match(/^(.+?)\s*[\-–—:]\s*(https?:\/\/\S+)(?:\s*[\-–—:]\s*(.+))?$/);
+                    if (m) {{
+                        title = m[1].trim();
+                        url = m[2];
+                        desc = m[3] ? m[3].trim() : null;
+                    }}
+                }}
+
+                // url - desc
+                if (!url) {{
+                    m = line.match(/^(https?:\/\/\S+)(?:\s*[\-–—:]\s*(.+))?$/);
+                    if (m) {{
+                        url = m[1];
+                        desc = m[2] ? m[2].trim() : null;
+                    }}
+                }}
+
+                if (!url) return;
+                if (!title) {{
+                    try {{
+                        var u = new URL(url);
+                        title = u.hostname;
+                    }} catch (e) {{
+                        title = url;
+                    }}
+                }}
+
+                var key = (function(u){{
+                    try {{
+                        var x = new URL(u);
+                        x.hash = '';
+                        x.search = '';
+                        var base = x.toString();
+                        return [u, base, base.endsWith('/') ? base.slice(0,-1) : base + '/'];
+                    }} catch(e) {{ return [u]; }}
+                }})(url);
+                var metaEntry = null;
+                for (var i=0;i<key.length;i++){{ if (meta[key[i]]) {{ metaEntry = meta[key[i]]; break; }} }}
+                if (metaEntry) {{
+                    if (metaEntry.title) title = metaEntry.title;
+                    if (metaEntry.description) desc = metaEntry.description;
+                }}
+
+                items.push({{ title: title, url: url, desc: desc }});
+            }});
+
+            if (!items.length) return;
+
+            // Create panel
+            var panel = document.createElement('div');
+            panel.className = 'annotation-panel';
+            var ul = document.createElement('ul');
+            ul.className = 'annotation-list';
+            items.forEach(function(it) {{
+                var li = document.createElement('li');
+                var wrap = document.createElement('div');
+                wrap.className = 'annotation-item';
+
+                var titleLine = document.createElement('div');
+                titleLine.className = 'annotation-item-titleline';
+                var aTitle = document.createElement('a');
+                aTitle.className = 'annotation-item-title';
+                aTitle.href = it.url;
+                aTitle.textContent = it.title;
+                aTitle.target = '_blank';
+                aTitle.rel = 'noopener noreferrer';
+
+                var aUrl = document.createElement('a');
+                aUrl.className = 'annotation-item-link';
+                aUrl.href = it.url;
+                aUrl.textContent = '(' + it.url + ')';
+                aUrl.target = '_blank';
+                aUrl.rel = 'noopener noreferrer';
+
+                titleLine.appendChild(aTitle);
+                titleLine.appendChild(document.createTextNode(' '));
+                titleLine.appendChild(aUrl);
+                wrap.appendChild(titleLine);
+
+                if (it.desc) {{
+                    var d = document.createElement('div');
+                    d.className = 'annotation-item-desc';
+                    d.textContent = it.desc;
+                    wrap.appendChild(d);
+                }}
+
+                li.appendChild(wrap);
+                ul.appendChild(li);
+            }});
+            panel.appendChild(ul);
+
+            // Insert panel after target
+            target.insertAdjacentElement('afterend', panel);
+
+            // Add toggle inside target (does not affect layout)
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'annotation-toggle';
+            btn.setAttribute('aria-expanded', 'false');
+            btn.setAttribute('title', 'Show related links');
+            btn.textContent = '▾';
+            target.style.position = target.style.position || 'relative';
+            target.appendChild(btn);
+
+            var toggle = function() {{
+                var open = panel.classList.toggle('open');
+                btn.classList.toggle('open', open);
+                btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+                if (open) {{
+                    panel.style.display = 'block';
+                }} else {{
+                    panel.style.display = 'none';
+                }}
+            }};
+            btn.addEventListener('click', toggle);
+
+            // Remove the original fenced block
+            pre.parentElement && pre.parentElement.removeChild(pre);
+        }});
+
+        // Annotations: detect plain paragraph 'Links:' followed by a list and fold it under previous block
+        var all = Array.prototype.slice.call(document.querySelectorAll('.post-content p'));
+        all.forEach(function(marker) {{
+            var txt = (marker.textContent || '').trim().toLowerCase();
+            if (txt !== 'links:' && txt !== 'links' && txt !== 'annotations:' && txt !== 'annotations') return;
+            var list = marker.nextElementSibling;
+            if (!list || ['UL','OL'].indexOf(list.tagName) === -1) return;
+
+            // Attach to previous meaningful block
+            var target = marker.previousElementSibling;
+            while (target && ['P','UL','OL','BLOCKQUOTE'].indexOf(target.tagName) === -1) {{
+                target = target.previousElementSibling;
+            }}
+            if (!target) return;
+
+            var panel = document.createElement('div');
+            panel.className = 'annotation-panel';
+            // Build list anew to include metadata
+            var newList = document.createElement(list.tagName.toLowerCase());
+            newList.className = 'annotation-list';
+            var anchors = list.querySelectorAll('a[href]');
+            anchors.forEach(function(a) {{
+                var url = a.getAttribute('href');
+                var title = (a.textContent || '').trim();
+                if (!title) {{
+                    try {{ title = new URL(url).hostname; }} catch(e) {{ title = url; }}
+                }}
+                var desc = null;
+                var metaEntry = meta[url];
+                if (metaEntry) {{
+                    if (metaEntry.title) title = metaEntry.title;
+                    if (metaEntry.description) desc = metaEntry.description;
+                }}
+                var li = document.createElement('li');
+                var wrap = document.createElement('div');
+                wrap.className = 'annotation-item';
+                var titleLine = document.createElement('div');
+                titleLine.className = 'annotation-item-titleline';
+                var aTitle = document.createElement('a');
+                aTitle.className = 'annotation-item-title';
+                aTitle.href = url;
+                aTitle.textContent = title;
+                aTitle.target = '_blank';
+                aTitle.rel = 'noopener noreferrer';
+                var aUrl = document.createElement('a');
+                aUrl.className = 'annotation-item-link';
+                aUrl.href = url;
+                aUrl.textContent = '(' + url + ')';
+                aUrl.target = '_blank';
+                aUrl.rel = 'noopener noreferrer';
+                titleLine.appendChild(aTitle);
+                titleLine.appendChild(document.createTextNode(' '));
+                titleLine.appendChild(aUrl);
+                wrap.appendChild(titleLine);
+                if (desc) {{
+                    var d = document.createElement('div');
+                    d.className = 'annotation-item-desc';
+                    d.textContent = desc;
+                    wrap.appendChild(d);
+                }}
+                li.appendChild(wrap);
+                newList.appendChild(li);
+            }});
+            panel.appendChild(newList);
+            target.insertAdjacentElement('afterend', panel);
+
+            var btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'annotation-toggle';
+            btn.setAttribute('aria-expanded', 'false');
+            btn.setAttribute('title', 'Show related links');
+            btn.textContent = '▾';
+            target.style.position = target.style.position || 'relative';
+            target.appendChild(btn);
+
+            var toggle = function() {{
+                var open = panel.classList.toggle('open');
+                btn.classList.toggle('open', open);
+                btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+                panel.style.display = open ? 'block' : 'none';
+            }};
+            btn.addEventListener('click', toggle);
+
+            // Remove original marker and list
+            list.parentElement && list.parentElement.removeChild(list);
+            marker.parentElement && marker.parentElement.removeChild(marker);
+        }});
     }});
     </script>
 </body>
-</html>"#,
+    </html>"#,
         post.title,
         config.title,
         css_path,
+        annotation_meta,
         home_path,
         home_path,
         config.title.to_uppercase(),
@@ -488,6 +756,74 @@ a:hover {
   color: #f5f5f5;
 }
 
+/* Annotation toggle and panel */
+.annotation-toggle {
+  position: absolute;
+  left: 50%;
+  bottom: -0.6em;
+  transform: translateX(-50%);
+  background: transparent;
+  color: #8b8b8b;
+  border: none;
+  cursor: pointer;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.9em;
+  line-height: 1;
+  padding: 0;
+  opacity: 0;
+  transition: opacity 0.2s ease, color 0.2s ease, transform 0.2s ease;
+}
+
+.post-content p:hover .annotation-toggle,
+.post-content ul:hover .annotation-toggle,
+.post-content ol:hover .annotation-toggle,
+.post-content blockquote:hover .annotation-toggle {
+  opacity: 1;
+}
+
+.annotation-toggle:hover { color: #f5f5f5; }
+.annotation-toggle.open { transform: translateX(-50%) rotate(180deg); }
+
+.annotation-panel {
+  display: none;
+  margin: 0.6em 0 1.2em 0;
+  padding: 10px 14px;
+  border-left: 2px solid #2a2a2a;
+  background-color: rgba(255,255,255,0.02);
+}
+
+.annotation-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.annotation-list li { margin: 6px 0; }
+.annotation-list a { color: #8b8b8b; }
+.annotation-list a:hover { color: #f5f5f5; }
+
+.annotation-item-titleline {
+  font-family: 'Crimson Text', Georgia, serif;
+}
+
+.annotation-item-title {
+  color: #f5f5f5;
+  text-decoration: none;
+}
+
+.annotation-item-link {
+  color: #8b8b8b;
+  text-decoration: none;
+}
+
+.annotation-item-link:hover, .annotation-item-title:hover {
+  color: #f5f5f5;
+}
+
+.annotation-item-desc {
+  color: #d0d0d0;
+  font-size: 0.95em;
+}
+
 /* Backlinks section */
 .backlinks {
   margin-top: 60px;
@@ -620,6 +956,14 @@ footer {
     display: inline;
     opacity: 1;
   }
+  .annotation-toggle {
+    position: static;
+    left: auto;
+    bottom: auto;
+    transform: none;
+    margin-left: 0.35em;
+    opacity: 1;
+  }
   
   .illuminated-initial {
     float: none;
@@ -668,6 +1012,8 @@ footer {
   .exa-link {
     display: none;
   }
+  .annotation-toggle { display: none; }
+  .annotation-panel { display: none; }
 }"#.to_string()
 }
 

@@ -7,7 +7,7 @@ use markdown::to_html;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_yaml;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path};
 use walkdir::WalkDir;
@@ -438,7 +438,10 @@ impl SiteGenerator {
                 let post_dir = Path::new(&config.output_dir).join(&post.slug);
                 fs::create_dir_all(&post_dir)?;
                 
-                let html = templates::render_post(&config, &post, &all_posts)?;
+                // Build annotation metadata JSON (URL -> { title, description })
+                let annotation_meta_json = build_annotation_meta_json(&post).await;
+
+                let html = templates::render_post(&config, &post, &all_posts, annotation_meta_json)?;
                 let output_path = post_dir.join("index.html");
                 fs::write(output_path, html)?;
                 Ok::<(), anyhow::Error>(())
@@ -482,6 +485,202 @@ impl SiteGenerator {
         Ok(())
     }
 } 
+
+/// Extract external URLs from annotation sections in raw markdown and fetch metadata.
+async fn build_annotation_meta_json(post: &Post) -> Option<String> {
+    let markdown = &post.content;
+    // Collect URLs from fenced blocks ```links/```anno and from a 'Links:' marker followed by list
+    let mut urls: HashSet<String> = HashSet::new();
+
+    // Simple stateful parse for fenced blocks
+    let mut in_links_block = false;
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            let lang = trimmed.trim_start_matches("```").trim().to_lowercase();
+            if !in_links_block && (lang == "links" || lang == "anno" || lang == "annotation") {
+                in_links_block = true;
+                continue;
+            }
+            if in_links_block && (lang.is_empty() || lang == "links" || lang == "anno" || lang == "annotation") {
+                in_links_block = false;
+                continue;
+            }
+        }
+        if in_links_block {
+            if let Some(u) = extract_url_from_line(trimmed) {
+                urls.insert(u);
+            }
+        }
+    }
+
+    // Also collect any anchors from rendered HTML content as a fallback
+    let html = &post.html_content;
+    if let Some(re) = Regex::new(r#"(?is)<a[^>]+href\s*=\s*([\"'])(https?://[^\"'>\s]+)\1"#).ok() {
+        for cap in re.captures_iter(html) {
+            if let Some(m) = cap.get(2) { urls.insert(m.as_str().to_string()); }
+        }
+    }
+
+    // Parse list after 'Links:' marker
+    let mut lines_iter = markdown.lines().peekable();
+    while let Some(line) = lines_iter.next() {
+        let t = line.trim();
+        if t.eq_ignore_ascii_case("links:") || t.eq_ignore_ascii_case("links") || t.eq_ignore_ascii_case("annotations:") || t.eq_ignore_ascii_case("annotations") {
+            // Consume subsequent list items
+            while let Some(next) = lines_iter.peek() {
+                let nt = next.trim();
+                if nt.starts_with("-") || nt.starts_with("*") || Regex::new(r"^\d+[\.)]\s+").unwrap().is_match(nt) { // bullet or ordered list
+                    let content = if nt.starts_with("-") || nt.starts_with("*") {
+                        nt.trim_start_matches(|c: char| c == '-' || c == '*' || c.is_whitespace()).trim().to_string()
+                    } else {
+                        Regex::new(r"^\d+[\.)]\s+").unwrap().replace(nt, "").to_string()
+                    };
+                    if let Some(u) = extract_url_from_line(content.trim()) {
+                        urls.insert(u);
+                    }
+                    lines_iter.next();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    if urls.is_empty() { return None; }
+
+    // Fetch metadata concurrently with a simple cap
+    let client = reqwest::Client::new();
+    let mut tasks = Vec::new();
+    for url in urls.into_iter().take(32) { // limit to 32 per post
+        let client = client.clone();
+        tasks.push(tokio::spawn(async move {
+            let meta = fetch_url_metadata(&client, &url).await.unwrap_or_default();
+            (url, meta)
+        }));
+    }
+
+    let mut map: HashMap<String, serde_json::Value> = HashMap::new();
+    for t in tasks {
+        if let Ok((url, meta)) = t.await {
+            let key_main = canonicalize_url(&url);
+            map.insert(key_main.clone(), meta.clone());
+            // also insert with/without trailing slash variants to maximize client hits
+            if key_main.ends_with('/') {
+                let no_slash = key_main.trim_end_matches('/').to_string();
+                map.insert(no_slash, meta.clone());
+            } else {
+                let with_slash = format!("{}/", key_main);
+                map.insert(with_slash, meta.clone());
+            }
+            // also insert the raw URL that was authored
+            map.insert(url, meta);
+        }
+    }
+
+    if map.is_empty() { return None; }
+    Some(serde_json::to_string(&map).unwrap_or_else(|_| String::new()))
+}
+
+async fn fetch_url_metadata(client: &reqwest::Client, url: &str) -> Result<serde_json::Value> {
+    use std::time::Duration;
+    let resp = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() { return Ok(serde_json::json!({})); }
+    let bytes = resp.bytes().await?;
+    let text = String::from_utf8_lossy(&bytes);
+
+    // Extract: <title>, og:title, meta description (order-insensitive attributes)
+    let title_tag = Regex::new(r"(?is)<title[^>]*>(.*?)</title>")
+        .ok()
+        .and_then(|re| re.captures(&text).and_then(|c| c.get(1)).map(|m| html_unescape(m.as_str())));
+    let og_title = Regex::new(r#"(?is)<meta[^>]*\bproperty\s*=\s*([\"'])og:title\1[^>]*\bcontent\s*=\s*([\"'])(.*?)\2|<meta[^>]*\bcontent\s*=\s*([\"'])(.*?)\4[^>]*\bproperty\s*=\s*([\"'])og:title\6"#)
+        .ok()
+        .and_then(|re| re.captures(&text)).and_then(|c| c.get(3).or_else(|| c.get(5))).map(|m| html_unescape(m.as_str()));
+    let tw_title = Regex::new(r#"(?is)<meta[^>]*\bname\s*=\s*([\"'])twitter:title\1[^>]*\bcontent\s*=\s*([\"'])(.*?)\2|<meta[^>]*\bproperty\s*=\s*([\"'])twitter:title\4[^>]*\bcontent\s*=\s*([\"'])(.*?)\5|<meta[^>]*\bcontent\s*=\s*([\"'])(.*?)\7[^>]*\bname\s*=\s*([\"'])twitter:title\8|<meta[^>]*\bcontent\s*=\s*([\"'])(.*?)\10[^>]*\bproperty\s*=\s*([\"'])twitter:title\11"#)
+        .ok()
+        .and_then(|re| re.captures(&text))
+        .and_then(|c| c.get(3).or_else(|| c.get(6)).or_else(|| c.get(8)).or_else(|| c.get(11)))
+        .map(|m| html_unescape(m.as_str()));
+    let name_desc_any = Regex::new(r#"(?is)<meta[^>]*\bname\s*=\s*([\"'])description\1[^>]*\bcontent\s*=\s*([\"'])(.*?)\2|<meta[^>]*\bcontent\s*=\s*([\"'])(.*?)\4[^>]*\bname\s*=\s*([\"'])description\6"#)
+        .ok()
+        .and_then(|re| re.captures(&text)).and_then(|c| c.get(3).or_else(|| c.get(5))).map(|m| html_unescape(m.as_str()));
+    let og_desc = Regex::new(r#"(?is)<meta[^>]*\bproperty\s*=\s*([\"'])og:description\1[^>]*\bcontent\s*=\s*([\"'])(.*?)\2|<meta[^>]*\bcontent\s*=\s*([\"'])(.*?)\4[^>]*\bproperty\s*=\s*([\"'])og:description\6"#)
+        .ok()
+        .and_then(|re| re.captures(&text)).and_then(|c| c.get(3).or_else(|| c.get(5))).map(|m| html_unescape(m.as_str()));
+    let tw_desc = Regex::new(r#"(?is)<meta[^>]*\bname\s*=\s*([\"'])twitter:description\1[^>]*\bcontent\s*=\s*([\"'])(.*?)\2|<meta[^>]*\bproperty\s*=\s*([\"'])twitter:description\4[^>]*\bcontent\s*=\s*([\"'])(.*?)\5|<meta[^>]*\bcontent\s*=\s*([\"'])(.*?)\7[^>]*\bname\s*=\s*([\"'])twitter:description\8|<meta[^>]*\bcontent\s*=\s*([\"'])(.*?)\10[^>]*\bproperty\s*=\s*([\"'])twitter:description\11"#)
+        .ok()
+        .and_then(|re| re.captures(&text))
+        .and_then(|c| c.get(3).or_else(|| c.get(6)).or_else(|| c.get(8)).or_else(|| c.get(11)))
+        .map(|m| html_unescape(m.as_str()));
+
+    let title = tw_title.or(og_title).or(title_tag);
+    let description = tw_desc.or(name_desc_any).or(og_desc);
+    let mut obj = serde_json::Map::new();
+    if let Some(t) = title { obj.insert("title".to_string(), serde_json::Value::String(t)); }
+    if let Some(d) = description { obj.insert("description".to_string(), serde_json::Value::String(d)); }
+    Ok(serde_json::Value::Object(obj))
+}
+
+fn html_unescape(s: &str) -> String {
+    let s = s.replace("&amp;", "&")
+             .replace("&lt;", "<")
+             .replace("&gt;", ">")
+             .replace("&quot;", "\"")
+             .replace("&#39;", "'");
+    Regex::new(r"\s+").map(|re| re.replace_all(&s, " ").to_string()).unwrap_or(s)
+}
+
+fn extract_url_from_line(line: &str) -> Option<String> {
+    // [Title](url) - desc
+    if let Some(caps) = Regex::new(r"\((https?://[^)\s]+)\)").ok().and_then(|re| re.captures(line)) {
+        return Some(caps.get(1).unwrap().as_str().to_string());
+    }
+    // Title - url or bare url
+    if let Some(caps) = Regex::new(r"(https?://\S+)").ok().and_then(|re| re.captures(line)) {
+        return Some(caps.get(1).unwrap().as_str().to_string());
+    }
+    None
+}
+
+fn canonicalize_url(url: &str) -> String {
+    // Lowercase scheme/host, remove fragment and query, collapse multiple slashes, keep trailing slash as-is
+    let mut s = url.trim().to_string();
+    if let Some(hash) = s.find('#') { s.truncate(hash); }
+    if let Some(q) = s.find('?') { s.truncate(q); }
+    // split scheme://host/path
+    if let Some(pos) = s.find("://") {
+        let (scheme, rest) = s.split_at(pos);
+        let rest = &rest[3..];
+        let mut parts = rest.splitn(2, '/');
+        let host = parts.next().unwrap_or("").to_lowercase();
+        let path = parts.next().unwrap_or("");
+        let mut rebuilt = String::new();
+        rebuilt.push_str(&scheme.to_lowercase());
+        rebuilt.push_str("://");
+        rebuilt.push_str(&host);
+        if !path.is_empty() { rebuilt.push('/'); rebuilt.push_str(path); }
+        // remove duplicate slashes in path
+        let mut result = String::new();
+        let mut prev_slash = false;
+        for ch in rebuilt.chars() {
+            if ch == '/' {
+                if !prev_slash { result.push(ch); }
+                prev_slash = true;
+            } else { result.push(ch); prev_slash = false; }
+        }
+        result
+    } else {
+        s
+    }
+}
 
 fn sanitize_slug(input: &str) -> String {
     // Lowercase and replace any non-alphanumeric with '-'

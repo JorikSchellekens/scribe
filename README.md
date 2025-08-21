@@ -11,6 +11,7 @@ A minimal static site generator written in Rust • ink • eternal
 - **Backlinks**: Automatic detection of links between posts
 - **Responsive**: Mobile-friendly design
 - **Fast**: Written in Rust for performance
+ - **Folded Annotations**: Add per-paragraph related links that fold open on click
 
 ## Installation
 
@@ -196,6 +197,44 @@ Your post content here...
 ## Subheadings
 
 More content...
+```
+
+### Folded Annotations (Related Links)
+
+You can attach related links to the previous paragraph or list. They are hidden by default and revealed with a small chevron on hover/click. They render as minimal previews: title (full-link) and an optional description line.
+
+Block-style (fenced) annotations:
+
+```markdown
+Some paragraph that mentions a topic.
+
+```links
+- [Great explainer](https://example.com/explainer) - Concise overview
+- https://example.com/paper — Research paper
+Title — https://example.com/deep-dive — Longer discussion
+[Spec](https://www.w3.org/) : W3C spec
+```
+```
+
+List-style annotations using a `Links:` marker:
+
+```markdown
+Some paragraph that mentions a topic.
+
+Links:
+- [Great explainer](https://example.com/explainer) - Concise overview
+- https://example.com/paper — Research paper
+```
+
+Supported syntaxes inside annotations:
+- [Title](https://domain.tld/path) - Optional description
+- Title — https://domain.tld/path — Optional description
+- https://domain.tld/path — Optional description
+
+Rendering result (each item):
+```
+Title (https://domain.tld/path)
+Optional description
 ```
 
 ## Development
