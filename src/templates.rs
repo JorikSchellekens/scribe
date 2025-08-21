@@ -4,7 +4,7 @@ use anyhow::Result;
 use regex;
 
 pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<String> {
-    let backlinks = find_backlinks(all_posts, &post.slug);
+    let backlinks = find_backlinks(all_posts, &post.slug, &post.original_slug);
     
     let has_initial = post.first_letter.is_some();
     
@@ -17,7 +17,9 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<S
             format!("<p>{}</p>", &caps[2])
         }).to_string();
     }
-    
+    // Rewrite internal links that may reference original, unsanitized slugs
+    processed_content = rewrite_internal_links(&processed_content, all_posts);
+
     // Load the illuminated initial data URL if it exists
     let initial_html = if has_initial {
         let initial_path = std::path::Path::new(&config.output_dir).join("initials").join(format!("{}.txt", post.first_letter.unwrap()));
@@ -116,6 +118,36 @@ pub fn render_post(config: &Config, post: &Post, all_posts: &[Post]) -> Result<S
     );
     
     Ok(html)
+}
+
+fn rewrite_internal_links(content: &str, all_posts: &[Post]) -> String {
+    let mut result = content.to_string();
+    for p in all_posts {
+        if p.original_slug != p.slug {
+            let pairs = [
+                // absolute
+                (format!("href=\"/{}/\"", p.original_slug), format!("href=\"/{}/\"", p.slug)),
+                (format!("href=\"/{}\"", p.original_slug), format!("href=\"/{}/\"", p.slug)),
+                (format!("href=\"/{}.md\"", p.original_slug), format!("href=\"/{}/\"", p.slug)),
+                // dot-relative
+                (format!("href=\"./{}/\"", p.original_slug), format!("href=\"./{}/\"", p.slug)),
+                (format!("href=\"./{}\"", p.original_slug), format!("href=\"./{}/\"", p.slug)),
+                (format!("href=\"./{}.md\"", p.original_slug), format!("href=\"./{}/\"", p.slug)),
+                // dotdot-relative
+                (format!("href=\"../{}/\"", p.original_slug), format!("href=\"../{}/\"", p.slug)),
+                (format!("href=\"../{}\"", p.original_slug), format!("href=\"../{}/\"", p.slug)),
+                (format!("href=\"../{}.md\"", p.original_slug), format!("href=\"../{}/\"", p.slug)),
+                // plain relative (no ./)
+                (format!("href=\"{}/\"", p.original_slug), format!("href=\"{}/\"", p.slug)),
+                (format!("href=\"{}\"", p.original_slug), format!("href=\"{}/\"", p.slug)),
+                (format!("href=\"{}.md\"", p.original_slug), format!("href=\"{}/\"", p.slug)),
+            ];
+            for (from, to) in pairs {
+                result = result.replace(&from, &to);
+            }
+        }
+    }
+    result
 }
 
 pub fn render_index(config: &Config, posts: &[Post]) -> Result<String> {
@@ -593,17 +625,42 @@ struct Backlink {
     url: String,
 }
 
-fn find_backlinks(posts: &[Post], current_slug: &str) -> Vec<Backlink> {
+fn find_backlinks(posts: &[Post], current_slug: &str, current_original_slug: &str) -> Vec<Backlink> {
     let mut backlinks = Vec::new();
     
     for post in posts {
         if post.slug != current_slug {
             // Simple backlink detection - look for links to current post
-            if post.html_content.contains(&format!("/{}/", current_slug)) {
-                backlinks.push(Backlink {
-                    title: post.title.clone(),
-                    url: format!("../{}/", post.slug),
-                });
+            let patterns = [
+                // sanitized slug
+                format!("/{}/", current_slug),
+                format!("/{}\"", current_slug),
+                format!("/{}.md\"", current_slug),
+                format!("./{}/", current_slug),
+                format!("./{}\"", current_slug),
+                format!("./{}.md\"", current_slug),
+                format!("../{}/", current_slug),
+                format!("../{}\"", current_slug),
+                format!("../{}.md\"", current_slug),
+                format!("{}/", current_slug),
+                format!("{}\"", current_slug),
+                format!("{}.md\"", current_slug),
+                // original slug as might appear in authored markdown
+                format!("/{}/", current_original_slug),
+                format!("/{}\"", current_original_slug),
+                format!("/{}.md\"", current_original_slug),
+                format!("./{}/", current_original_slug),
+                format!("./{}\"", current_original_slug),
+                format!("./{}.md\"", current_original_slug),
+                format!("../{}/", current_original_slug),
+                format!("../{}\"", current_original_slug),
+                format!("../{}.md\"", current_original_slug),
+                format!("{}/", current_original_slug),
+                format!("{}\"", current_original_slug),
+                format!("{}.md\"", current_original_slug),
+            ];
+            if patterns.iter().any(|p| post.html_content.contains(p)) {
+                backlinks.push(Backlink { title: post.title.clone(), url: format!("../{}/", post.slug) });
             }
         }
     }

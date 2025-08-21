@@ -5,6 +5,13 @@ use std::path::PathBuf;
 use std::process;
 use warp::Filter;
 use ipfs_api_backend_hyper::{IpfsApi, IpfsClient, TryFromUri};
+use notify::{RecursiveMode, Watcher, PollWatcher};
+use std::sync::mpsc;
+use std::time::Duration;
+use warp::ws::{Message, WebSocket};
+use futures_util::sink::SinkExt;
+use std::sync::Arc;
+use tokio::sync::{broadcast, RwLock};
 
 mod config;
 mod generator;
@@ -43,6 +50,14 @@ enum Commands {
         /// Host to bind to
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+        
+        /// Path to config file
+        #[arg(short, long, default_value = "config.json")]
+        config: PathBuf,
+        
+        /// Watch for changes and regenerate automatically
+        #[arg(short, long, default_value = "true")]
+        watch: bool,
     },
     /// Generate illuminated initials for specific letters
     Initials {
@@ -81,6 +96,24 @@ enum Commands {
         #[arg(short, long, default_value = "true")]
         recursive: bool,
     },
+    /// Create a new blog post
+    New {
+        /// Title of the new post
+        #[arg(short, long)]
+        title: String,
+        
+        /// Excerpt/description of the post
+        #[arg(short, long)]
+        excerpt: Option<String>,
+        
+        /// Path to config file
+        #[arg(short, long, default_value = "config.json")]
+        config: PathBuf,
+        
+        /// Posts directory
+        #[arg(short, long)]
+        posts_dir: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -111,8 +144,8 @@ async fn main() -> Result<()> {
                 process::exit(1);
             }
         }
-        Commands::Serve { dist, port, host } => {
-            serve_site(dist, host, port).await?;
+        Commands::Serve { dist, port, host, config, watch } => {
+            serve_site(dist, host, port, config, watch).await?;
         }
         Commands::Initials { letters, config, output } => {
             generate_initials_command(letters, config, output).await?;
@@ -123,12 +156,18 @@ async fn main() -> Result<()> {
         Commands::Pin { dist, ipfs_api, name, recursive } => {
             pin_to_ipfs(dist, ipfs_api, name, recursive).await?;
         }
+        Commands::New { title, excerpt, config, posts_dir } => {
+            create_new_post(title, excerpt, config, posts_dir).await?;
+        }
     }
     
     Ok(())
 }
 
-async fn serve_site(dist_path: PathBuf, host: String, port: u16) -> Result<()> {
+// Global hot reload broadcaster
+type HotReloadSender = Arc<RwLock<Option<broadcast::Sender<String>>>>;
+
+async fn serve_site(dist_path: PathBuf, host: String, port: u16, config_path: PathBuf, watch: bool) -> Result<()> {
     // Check if dist directory exists
     if !dist_path.exists() {
         eprintln!("{}", format!("Error: Directory '{}' does not exist. Run 'scribe generate' first.", dist_path.display()).red());
@@ -143,20 +182,74 @@ async fn serve_site(dist_path: PathBuf, host: String, port: u16) -> Result<()> {
     println!("{}", format!("Starting server...").green().bold());
     println!("{}", format!("Serving: {}", dist_path.display()).blue());
     println!("{}", format!("URL: http://{}:{}", host, port).blue());
+    
+    // Create hot reload broadcaster
+    let hot_reload_tx: HotReloadSender = Arc::new(RwLock::new(None));
+    
+    // Setup file watching if enabled
+    let _watcher_handle = if watch {
+        println!("{}", "File watching enabled - changes will trigger regeneration".yellow());
+        // Create broadcast channel for hot reload
+        let (reload_tx, _) = broadcast::channel(100);
+        *hot_reload_tx.write().await = Some(reload_tx.clone());
+        Some(setup_file_watcher(config_path.clone(), Some(reload_tx)).await?)
+    } else {
+        None
+    };
+    
     println!("{}", format!("Press Ctrl+C to stop").yellow());
 
-    // Create the static file serving route
+    // Create static file serving route
     let static_files = warp::fs::dir(dist_path.clone())
         .or(warp::path::end().and(warp::fs::file(dist_path.join("index.html"))));
+
+    // Redirect route: map unsanitized single-segment paths to sanitized directories
+    let redirect_dist = dist_path.clone();
+    let sanitize_redirect = warp::path::param::<String>()
+        .and(warp::path::end())
+        .and_then(move |slug: String| {
+            let redirect_dist = redirect_dist.clone();
+            async move {
+                let sanitized = sanitize_slug(&slug);
+                let sanitized_dir = redirect_dist.join(&sanitized);
+                // Only redirect if a generated directory exists for the sanitized slug
+                if sanitized != slug && sanitized_dir.is_dir() {
+                    let uri: warp::http::Uri = format!("/{}/", sanitized).parse().unwrap();
+                    Ok::<_, warp::Rejection>(warp::redirect::see_other(uri))
+                } else {
+                    Err(warp::reject::not_found())
+                }
+            }
+        });
 
     let cors = warp::cors()
         .allow_any_origin()
         .allow_headers(vec!["content-type"])
         .allow_methods(vec!["GET", "POST", "DELETE"]);
 
-    let routes = static_files
-        .with(cors)
-        .with(warp::log("scribe"));
+    // Create routes with optional WebSocket for hot reload
+    let routes = if watch {
+        let hot_reload_tx_clone = hot_reload_tx.clone();
+        let ws_route = warp::path("__hot_reload__")
+            .and(warp::ws())
+            .and(warp::any().map(move || hot_reload_tx_clone.clone()))
+            .and_then(|ws: warp::ws::Ws, hot_reload_tx: HotReloadSender| async move {
+                Ok::<_, warp::Rejection>(ws.on_upgrade(move |socket| handle_websocket(socket, hot_reload_tx)))
+            });
+        
+        ws_route
+            .or(sanitize_redirect)
+            .or(static_files)
+            .with(cors)
+            .with(warp::log("scribe"))
+            .boxed()
+    } else {
+        sanitize_redirect
+            .or(static_files)
+            .with(cors)
+            .with(warp::log("scribe"))
+            .boxed()
+    };
 
     // Parse the host address
     let addr: std::net::IpAddr = host.parse()
@@ -246,6 +339,31 @@ async fn generate_initials_command(letters: String, config_path: PathBuf, output
     println!("{}", "Illuminated initials generation complete!".green());
     
     Ok(())
+}
+
+fn sanitize_slug(input: &str) -> String {
+    let lowered = input.to_lowercase();
+    let provisional: String = lowered
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let collapsed = {
+        // collapse runs of '-'
+        let mut out = String::with_capacity(provisional.len());
+        let mut last_dash = false;
+        for ch in provisional.chars() {
+            if ch == '-' {
+                if !last_dash { out.push('-'); }
+                last_dash = true;
+            } else {
+                out.push(ch);
+                last_dash = false;
+            }
+        }
+        out
+    };
+    let trimmed = collapsed.trim_matches('-').to_string();
+    if trimmed.is_empty() { "untitled".to_string() } else { trimmed }
 }
 
 async fn create_project(directory: PathBuf) -> Result<()> {
@@ -676,6 +794,205 @@ async fn pin_to_ipfs(
     println!("  • Pin your content on multiple IPFS nodes for better availability");
     println!("  • Consider using a pinning service like Pinata or Infura for production");
     println!("  • Share the IPFS hash for decentralized access to your site");
+    
+    Ok(())
+}
+
+async fn handle_websocket(ws: WebSocket, hot_reload_tx: HotReloadSender) {
+    let mut ws = ws;
+    
+    // Get the reload receiver
+    let mut reload_rx = {
+        let guard = hot_reload_tx.read().await;
+        if let Some(tx) = guard.as_ref() {
+            tx.subscribe()
+        } else {
+            return; // No broadcaster available
+        }
+    };
+    
+    // Listen for reload messages and forward them to the WebSocket
+    while let Ok(msg) = reload_rx.recv().await {
+        if ws.send(Message::text(msg)).await.is_err() {
+            break; // Client disconnected
+        }
+    }
+}
+
+
+
+struct WatcherHandle {
+    _watcher: PollWatcher,
+    _task_handle: tokio::task::JoinHandle<()>,
+}
+
+async fn setup_file_watcher(config_path: PathBuf, hot_reload_tx: Option<broadcast::Sender<String>>) -> Result<WatcherHandle> {
+    let (tx, rx) = mpsc::channel();
+    
+    let mut watcher = PollWatcher::new(
+        move |res| {
+            if let Ok(event) = res {
+                if let Err(e) = tx.send(event) {
+                    eprintln!("Failed to send file watch event: {}", e);
+                }
+            }
+        },
+        notify::Config::default().with_poll_interval(Duration::from_secs(1)),
+    )?;
+    
+    // Load config to get posts directory
+    let config = Config::load(&config_path)?;
+    let posts_dir = PathBuf::from(&config.posts_dir);
+    
+    if posts_dir.exists() {
+        watcher.watch(&posts_dir, RecursiveMode::Recursive)?;
+        println!("{}", format!("Watching: {}", posts_dir.display()).blue());
+    }
+    
+    // Also watch config file
+    watcher.watch(&config_path, RecursiveMode::NonRecursive)?;
+    
+    // Spawn background task to handle file changes
+    let task_handle = tokio::spawn(async move {
+        let mut last_generation = std::time::Instant::now();
+        
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => {
+                    // Check if it's a markdown file or config file
+                    let is_relevant = event.paths.iter().any(|path| {
+                        path.extension().map_or(false, |ext| ext == "md") || 
+                        path.file_name().map_or(false, |name| name == "config.json")
+                    });
+                    
+                    if is_relevant {
+                        // Debounce: only regenerate if it's been at least 1 second since last generation
+                        if last_generation.elapsed() > Duration::from_secs(1) {
+                            // Accept various event types, not just Modify
+                            match event.kind {
+                                notify::EventKind::Create(_) | 
+                                notify::EventKind::Modify(_) | 
+                                notify::EventKind::Remove(_) => {
+                                    println!("{}", "File changed, regenerating site...".yellow());
+                                    last_generation = std::time::Instant::now();
+                                    
+                                    // Regenerate site
+                                    if let Err(e) = regenerate_site(&config_path).await {
+                                        eprintln!("{}", format!("Regeneration failed: {}", e).red());
+                                    } else {
+                                        println!("{}", "Site regenerated successfully!".green());
+                                        
+                                        // Send hot reload notification
+                                        if let Some(ref tx) = hot_reload_tx {
+                                            let _ = tx.send("reload".to_string());
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    // Ignore other event types
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Continue the loop
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+    });
+    
+    Ok(WatcherHandle {
+        _watcher: watcher,
+        _task_handle: task_handle,
+    })
+}
+
+async fn regenerate_site(config_path: &PathBuf) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let mut generator = SiteGenerator::new(config);
+    generator.generate().await?;
+    Ok(())
+}
+
+async fn create_new_post(title: String, excerpt: Option<String>, config_path: PathBuf, posts_dir: Option<PathBuf>) -> Result<()> {
+    // Load configuration to get author and posts directory
+    let config = Config::load(&config_path)
+        .context("Failed to load configuration")?;
+    
+    let posts_directory = posts_dir.unwrap_or_else(|| PathBuf::from(&config.posts_dir));
+    
+    // Create posts directory if it doesn't exist
+    std::fs::create_dir_all(&posts_directory)
+        .context("Failed to create posts directory")?;
+    
+    // Generate slug from title
+    let slug = title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    
+    // Create filename
+    let filename = format!("{}.md", slug);
+    let file_path = posts_directory.join(&filename);
+    
+    // Check if file already exists
+    if file_path.exists() {
+        eprintln!("{}", format!("Error: File '{}' already exists.", file_path.display()).red());
+        process::exit(1);
+    }
+    
+    // Get current date
+    let current_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    
+    // Create frontmatter and content
+    let excerpt_line = if let Some(ref exc) = excerpt {
+        format!("excerpt: \"{}\"\n", exc.replace('"', "\\\""))
+    } else {
+        String::new()
+    };
+    
+    let content = format!(
+        r#"---
+title: "{}"
+date: "{}"
+{}---
+
+Write your post content here...
+
+"#,
+        title.replace('"', "\\\""),
+        current_date,
+        excerpt_line
+    );
+    
+    // Write the file
+    std::fs::write(&file_path, content)
+        .context("Failed to write new post file")?;
+    
+    println!("{}", "New post created successfully!".green().bold());
+    println!();
+    println!("{}: {}", "Title".white().bold(), title.cyan());
+    println!("{}: {}", "Author".white().bold(), config.author.cyan());
+    println!("{}: {}", "Date".white().bold(), current_date.cyan());
+    if let Some(exc) = excerpt {
+        println!("{}: {}", "Excerpt".white().bold(), exc.cyan());
+    }
+    println!("{}: {}", "File".white().bold(), file_path.display().to_string().cyan());
+    println!();
+    println!("Next steps:");
+    println!("  1. Edit the file: {}", file_path.display().to_string().yellow());
+    println!("  2. Generate site: {}", "scribe generate".yellow());
+    println!("  3. Serve locally: {}", "scribe serve".yellow());
     
     Ok(())
 } 

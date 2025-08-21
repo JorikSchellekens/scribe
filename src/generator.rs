@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Post {
     pub slug: String,
+    pub original_slug: String,
     pub title: String,
     pub date: DateTime<Utc>,
     pub excerpt: Option<String>,
@@ -156,14 +157,16 @@ impl SiteGenerator {
                     .map(|line| line.trim().to_string())
             });
         
-        let slug = path
+        let original_slug = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("untitled")
             .to_string();
+        let slug = sanitize_slug(&original_slug);
         
         Ok(Post {
             slug,
+            original_slug,
             title,
             date,
             excerpt,
@@ -366,3 +369,17 @@ impl SiteGenerator {
         Ok(())
     }
 } 
+
+fn sanitize_slug(input: &str) -> String {
+    // Lowercase and replace any non-alphanumeric with '-'
+    let lowered = input.to_lowercase();
+    let provisional: String = lowered
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    // Collapse multiple '-' and trim from ends
+    let re = Regex::new(r"-+").unwrap();
+    let collapsed = re.replace_all(&provisional, "-").to_string();
+    let trimmed = collapsed.trim_matches('-').to_string();
+    if trimmed.is_empty() { "untitled".to_string() } else { trimmed }
+}
