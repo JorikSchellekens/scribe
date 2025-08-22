@@ -589,6 +589,7 @@ header {
   font-weight: 700;
   line-height: 1.2;
   margin-bottom: 30px;
+  padding-bottom: 12px; /* reserve space for underline */
   color: #f5f5f5;
   position: relative;
 }
@@ -596,7 +597,7 @@ header {
 .post-title::after {
   content: '';
   position: absolute;
-  bottom: -12px;
+  bottom: 0;
   left: 0;
   right: 0;
   height: 1px;
@@ -608,6 +609,13 @@ header {
   font-size: 20px;
   line-height: 1.4;
   margin-bottom: 60px;
+}
+
+.post-content hr {
+  border: none;
+  border-top: 1px solid #2a2a2a;
+  height: 0;
+  margin: 32px 0 24px 0;
 }
 
 .post-content p {
@@ -631,6 +639,7 @@ header {
   font-size: 28px;
   font-weight: 600;
   margin: 40px 0 20px 0;
+  padding-bottom: 8px; /* reserve space for underline */
   color: #f5f5f5;
   position: relative;
   text-align: right;
@@ -639,7 +648,7 @@ header {
 .post-content h2::after {
   content: '';
   position: absolute;
-  bottom: -8px;
+  bottom: 0;
   left: 0;
   right: 0;
   height: 1px;
